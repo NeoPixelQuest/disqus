@@ -125,7 +125,10 @@ class DisqusComment extends SourcePluginBase implements ContainerFactoryPluginIn
   public function prepareRow(Row $row) {
     $row->setSourceProperty('uid', 0);
     $email = $row->getSourceProperty('email');
-    $user = $this->entityTypeManager->getStorage('user')->getQuery()->condition('mail', $email)->execute();
+    $user = $this->entityTypeManager->getStorage('user')->getQuery()
+      ->condition('mail', $email)
+      ->accessCheck(FALSE)
+      ->execute();
     if ($user) {
       $row->setSourceProperty('uid', key($user));
     }

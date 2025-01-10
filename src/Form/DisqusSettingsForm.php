@@ -5,6 +5,7 @@ namespace Drupal\disqus\Form;
 use Drupal\disqus\DisqusCommentManagerInterface;
 use Drupal\file\FileUsage\FileUsageInterface;
 use Drupal\Core\Config\ConfigFactoryInterface;
+use Drupal\Core\Config\TypedConfigManagerInterface;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\Core\Extension\ModuleHandlerInterface;
 use Drupal\Core\Form\ConfigFormBase;
@@ -42,6 +43,8 @@ class DisqusSettingsForm extends ConfigFormBase {
    *
    * @param \Drupal\Core\Config\ConfigFactoryInterface $config_factory
    *   The factory for configuration objects.
+   * @param \Drupal\Core\Config\TypedConfigManagerInterface $typedConfigManager
+   *   The typed config manager.
    * @param \Drupal\Core\Extension\ModuleHandlerInterface $module_handler
    *   The module handler.
    * @param \Drupal\file\FileUsage\FileUsageInterface $file_usage
@@ -49,8 +52,8 @@ class DisqusSettingsForm extends ConfigFormBase {
    * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
    *   The entity type manager.
    */
-  public function __construct(ConfigFactoryInterface $config_factory, ModuleHandlerInterface $module_handler, FileUsageInterface $file_usage, EntityTypeManagerInterface $entity_type_manager) {
-    parent::__construct($config_factory);
+  public function __construct(ConfigFactoryInterface $config_factory, TypedConfigManagerInterface $typedConfigManager, ModuleHandlerInterface $module_handler, FileUsageInterface $file_usage, EntityTypeManagerInterface $entity_type_manager) {
+    parent::__construct($config_factory, $typedConfigManager);
     $this->moduleHandler = $module_handler;
     $this->fileUsage = $file_usage;
     $this->entityTypeManager = $entity_type_manager;
@@ -62,6 +65,7 @@ class DisqusSettingsForm extends ConfigFormBase {
   public static function create(ContainerInterface $container) {
     return new static(
       $container->get('config.factory'),
+      $container->get('config.typed'),
       $container->get('module_handler'),
       $container->get('file.usage'),
       $container->get('entity_type.manager')
