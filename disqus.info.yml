@@ -1,0 +1,8 @@
+name: Disqus
+type: module
+description: 'Integrated the Disqus web service to enhance comments in Drupal.'
+core_version_requirement: ^9 || ^10 || ^11
+configure: disqus.settings
+dependencies:
+  - drupal:file
+  - drupal:field

@@ -1,0 +1,369 @@
+<?php
+
+/**
+ * @file
+ * The Disqus Drupal module.
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Url;
+use Drupal\disqus\Plugin\migrate\DisqusDeriver;
+use Drupal\migrate\Exception\RequirementsException;
+use Drupal\migrate\Plugin\MigrateSourceInterface;
+use Drupal\migrate\Plugin\MigrationInterface;
+use Drupal\migrate\Row;
+use Drupal\migrate_drupal\Plugin\migrate\source\DrupalSqlBase;
+use Drupal\node\NodeInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\ContentEntityInterface;
+use Drupal\disqus\DisqusCommentManagerInterface;
+use Drupal\field\FieldStorageConfigInterface;
+
+/**
+ * Implements hook_help().
+ */
+function disqus_help($route_name, RouteMatchInterface $route_match) {
+  switch ($route_name) {
+    case 'help.page.disqus':
+      $output = '<p>' . t('Uses the <a href=":disqus">Disqus</a> comment system to enhance comments.', [
+        ':disqus' => Url::fromUri('http://disqus.com/')->toString(),
+      ]) . '</p>';
+      $output .= '<h3>' . t('Installation') . '</h3>';
+      $output .= '<ol><li>' . t('Register your site information at <a href=":disqus">Disqus</a>.', [':disqus' => Url::fromUri('http://disqus.com/')->toString()]) . '</li>';
+      $output .= '<li>' . t('In the <a href=":configuration">Disqus configuration</a>, set the domain to what you registered with Disqus.',
+          [':configuration' => Url::fromRoute('disqus.settings')->toString()]) . '</li>';
+      $output .= '<li>' . t('Disqus comments can be enabled for any <a href=":entity-help">entity sub-type</a> (for example, a <a href=":content-type">content type</a>). On the Manage fields page for each entity sub-type, you can enable disqus by adding a Disqus comments field.', [
+        ':entity-help' => Url::fromRoute('help.page', ['name' => 'entity'])->toString(),
+        ':content-type' => Url::fromRoute('entity.node_type.collection')->toString(),
+      ]) . '</li>';
+      $output .= '<li>' . t('Alternatively disqus comments can be used on <a href=":blocks">Blocks</a>. You will first need to configure the disqus comment field for any entity sub-type.',
+        [':blocks' => Url::fromRoute('block.admin_display')->toString()]) . '</li>';
+      $output .= '<li>' . t('Visit the <a href=":permissions">permissions</a>, and set which users you would like to have the ability to view Disqus threads (recommended for role).',
+        [
+          ':permissions' => Url::fromRoute('user.admin_permissions',
+        [],
+        [
+          'fragment' => 'module-disqus',
+        ])->toString(),
+        ]) . '</li></ol>';
+      return $output;
+
+    case 'disqus.settings':
+      return '<p>' . t('The following provides the general configuration options for the <a href=":disqus">Disqus</a> comment web service.',
+          [':disqus' => Url::fromUri('http://disqus.com')->toString()]) . '</p>';
+  }
+}
+
+/**
+ * Implements hook_node_links_alter().
+ */
+function disqus_node_links_alter(array &$node_links, NodeInterface $node, array &$context) {
+  $fields = \Drupal::service('disqus.manager')->getFields('node');
+  foreach ($fields as $field_name => $detail) {
+    // Skip fields that the node does not have.
+    if (!$node->hasField($field_name)) {
+      continue;
+    }
+    $links = [];
+    if ($node->get($field_name)->status) {
+      if (\Drupal::currentUser()->hasPermission('view disqus comments')) {
+        if ($context['view_mode'] === 'teaser') {
+          // Display the Disqus link.
+          $links['disqus_comments_num'] = [
+            'title' => t('Comments'),
+            'url' => $node->toUrl(),
+            'fragment' => 'disqus_thread',
+            'attributes' => [
+              // Identify the node for Disqus with the unique identifier:
+              // http://docs.disqus.com/developers/universal/#comment-count
+              'data-disqus-identifier' => $node->get($field_name)->identifier ?: 'node/' . $node->id(),
+            ],
+          ];
+        }
+        $node_links['disqus'] = [
+          '#theme' => 'links',
+          '#links' => $links,
+          '#attributes' => [
+            'class' => ['links', 'inline'],
+          ],
+        ];
+
+        // Attach disqus library to load the Disqus comment count JavaScript.
+        $node_links['#attached']['library'][] = 'disqus/disqus';
+        $node_links['disqus']['#attached']['drupalSettings']['disqusComments'] = \Drupal::config('disqus.settings')
+          ->get('disqus_domain');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function disqus_entity_delete(EntityInterface $entity) {
+  // Only act on content entities.
+  if (!($entity instanceof ContentEntityInterface)) {
+    return;
+  }
+
+  $field = \Drupal::service('disqus.manager')
+    ->getFields($entity->getEntityTypeId());
+  $field_name = key($field);
+  if (!$entity->hasField($field_name)) {
+    return;
+  }
+  $messenger = \Drupal::messenger();
+
+  $config = \Drupal::config('disqus.settings');
+  // Close/remove the thread on disqus if required.
+  $action = $config->get('advanced.api.disqus_api_delete');
+  if ($action != DisqusCommentManagerInterface::DISQUS_API_NO_ACTION) {
+    $disqus = disqus_api();
+    if ($disqus) {
+      try {
+        // Load the thread data from disqus. Passing thread is required to allow
+        // the thread:ident call to work correctly. There is a pull request to
+        // fix this issue.
+        $thread = $disqus->threads->details([
+          'forum' => $config->get('disqus_domain'),
+          'thread:ident' => "{$entity->get($field_name)->identifier}" ?: "{$entity->getEntityTypeId()}/{$entity->id()}",
+          'thread' => '1',
+        ]);
+      }
+      catch (Exception $exception) {
+        $messenger->addError(t('There was an error loading the thread details from Disqus.'));
+        \Drupal::logger('disqus')
+          ->error('Error loading thread details for entity : @identifier. Check your API keys.', ['@identifier' => "{$entity->get($field_name)->identifier}" ?: "{$entity->getEntityTypeId()}/{$entity->id()}"]);
+      }
+      if (isset($thread->id)) {
+        if ($action == DisqusCommentManagerInterface::DISQUS_API_CLOSE) {
+          try {
+            $disqus->threads->close([
+              'access_token' => $config->get('advanced.disqus_useraccesstoken'),
+              'thread' => $thread->id,
+              'forum' => $config->get('disqus_domain'),
+            ]);
+          }
+          catch (Exception $exception) {
+            $messenger->addError(t('There was an error closing the thread on Disqus.'));
+            \Drupal::logger('disqus')
+              ->error('Error closing thread for entity : @identifier. Check your user access token.', ['@identifier' => "{$entity->get($field_name)->identifier}" ?: "{$entity->getEntityTypeId()}/{$entity->id()}"]);
+          }
+        }
+        if ($action == DisqusCommentManagerInterface::DISQUS_API_REMOVE) {
+          try {
+            $disqus->threads->remove([
+              'access_token' => $config->get('advanced.disqus_useraccesstoken'),
+              'thread' => $thread->id,
+              'forum' => $config->get('disqus_domain'),
+            ]);
+          }
+          catch (Exception $exception) {
+            $messenger->addError(t('There was an error removing the thread on Disqus.'));
+            \Drupal::logger('disqus')
+              ->error('Error closing thread for entity : @identifier. Check your user access token.', ['@identifier' => "{$entity->get($field_name)->identifier}" ?: "{$entity->getEntityTypeId()}/{$entity->id()}"]);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function disqus_entity_update(EntityInterface $entity) {
+  // Only act on content entities.
+  if (!($entity instanceof ContentEntityInterface)) {
+    return;
+  }
+
+  $field = \Drupal::service('disqus.manager')
+    ->getFields($entity->getEntityTypeId());
+  $field_name = key($field);
+  if (!$entity->hasField(key($field))) {
+    return;
+  }
+
+  $messenger = \Drupal::messenger();
+
+  $config = \Drupal::config('disqus.settings');
+  // Update the thread information on disqus if required.
+  if ($config->get('advanced.api.disqus_api_update') && ($entity->label() != $entity->original->label() || $entity->toUrl()->toString() != $entity->original->toUrl()->toString())) {
+    $disqus = disqus_api();
+    if ($disqus) {
+      try {
+        // Load the thread data from disqus. Passing thread is required to allow
+        // the thread:ident call to work correctly. There is a pull request to
+        // fix this issue.
+        $thread = $disqus->threads->details([
+          'forum' => $config->get('disqus_domain'),
+          'thread:ident' => "{$entity->get($field_name)->identifier}" ?: "{$entity->getEntityTypeId()}/{$entity->id()}",
+          'thread' => '1',
+        ]);
+      }
+      catch (Exception $exception) {
+        $messenger->addError(t('There was an error loading the thread details from Disqus.'));
+        \Drupal::logger('disqus')
+          ->error('Error loading thread details for entity : @identifier. Check your API keys.', ['@identifier' => "{$entity->get($field_name)->identifier}" ?: "{$entity->getEntityTypeId()}/{$entity->id()}"]);
+      }
+      if (isset($thread->id)) {
+        try {
+          $disqus->threads->update([
+            'access_token' => $config->get('advanced.disqus_useraccesstoken'),
+            'thread' => $thread->id,
+            'forum' => $config->get('disqus_domain'),
+            'title' => $entity->label(),
+            'url' => $entity->toUrl('canonical', ['absolute' => TRUE]),
+          ]);
+        }
+        catch (Exception $exception) {
+          $messenger->addError(t('There was an error updating the thread details on Disqus.'));
+          \Drupal::logger('disqus')
+            ->error('Error updating thread details for entity : @identifier. Check your user access token.', ['@identifier' => "{$entity->get($field_name)->identifier}" ?: "{$entity->getEntityTypeId()}/{$entity->id()}"]);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function disqus_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'new_comment':
+      $post = $params['post'];
+      $message['subject'] = t('New comment posted to @title', ['@title' => $post->thread->title]);
+      $message['body'] = [
+        t('New comment posted on :url by @author:', [
+          ':url' => $post->url,
+          '@author' => $post->author->name,
+        ]),
+        $post->raw_message,
+      ];
+      break;
+  }
+}
+
+/**
+ * Implements hook_field_views_data().
+ */
+function disqus_field_views_data(FieldStorageConfigInterface $field_storage) {
+  $data = views_field_default_views_data($field_storage);
+  foreach ($data as $table_name => $table_data) {
+    $data[$table_name]['entity_id']['field'] = [
+      'title' => t('Disqus Comment Count'),
+      'group' => t('Content'),
+      'help' => t('The number of Disqus comments made on the post. Note that this will not work in the preview.'),
+      'id' => 'disqus_comment_count',
+    ];
+  }
+  return $data;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function disqus_theme() {
+  $domain = \Drupal::config('disqus.settings')->get('disqus_domain');
+  return [
+    'disqus_noscript' => [
+      'variables' => [
+        'message' => t('View the discussion thread.'),
+        'url' => "http://$domain.disqus.com/",
+      ],
+    ],
+  ];
+}
+
+/**
+ * Creates an instance of the Disqus PHP API.
+ *
+ * @return object|bool
+ *   The instance of the Disqus API.
+ */
+function disqus_api() {
+  try {
+    $disqus = new DisqusAPI(\Drupal::config('disqus.settings')
+      ->get('advanced.disqus_secretkey'));
+  }
+  catch (Exception $exception) {
+    \Drupal::messenger()->addError(t('There was an error loading the Disqus PHP API. Please check your API keys and try again.'));
+    \Drupal::logger('disqus')
+      ->error('Error loading the Disqus PHP API. Check your API keys.', []);
+    return FALSE;
+  }
+  return $disqus;
+}
+
+/**
+ * Implements hook_migration_plugins_alter().
+ */
+function disqus_migration_plugins_alter(array &$migrations) {
+  $node_migrations = array_filter(
+    $migrations,
+    function ($definition) {
+      return $definition['id'] === 'd7_node' || $definition['id'] === 'd7_node_complete';
+    }
+  );
+
+  $disqus_plugin = DisqusDeriver::getSourcePlugin('disqus_enabled_content_types');
+  assert($disqus_plugin instanceof DrupalSqlBase);
+  try {
+    $disqus_plugin->checkRequirements();
+  }
+  catch (RequirementsException $e) {
+    // Disqus module isn't enabled in the source instance, so we don't have to
+    // do anything but remove the d7_disqus_settings and d7_disqus_field_storage
+    // migrations.
+    unset($migrations['d7_disqus_settings']);
+    unset($migrations['d7_disqus_field_storage']);
+    return;
+  }
+
+  $disqus_node_types = array_reduce(
+    iterator_to_array($disqus_plugin, FALSE),
+    function (array $carry, Row $row) {
+      $carry[] = $row->getSourceProperty('type');
+      return $carry;
+    },
+    []
+  );
+
+  foreach ($node_migrations as $plugin_id => $definition) {
+    if (
+      !empty($definition['source']['node_type']) &&
+      !in_array($definition['source']['node_type'], $disqus_node_types)
+    ) {
+      continue;
+    }
+    $migrations[$plugin_id]['migration_tags'][] = 'Disqus field value';
+    $migrations[$plugin_id]['process']['disqus/status'] = 'disqus_status';
+    $migrations[$plugin_id]['process']['disqus/identifier'] = 'disqus_identifier';
+  }
+
+}
+
+/**
+ * Implements hook_migrate_prepare_row().
+ */
+function disqus_migrate_prepare_row(Row $row, MigrateSourceInterface $source, MigrationInterface $migration) {
+  if (!in_array('Disqus field value', $migration->getMigrationTags())) {
+    return;
+  }
+
+  $database_connection = $source->getDatabase();
+
+  $query = $database_connection->select('node', 'n')
+    ->condition('n.nid', $row->getSourceProperty('nid'));
+  $query->leftJoin('disqus', 'd', 'd.nid = n.nid');
+  $query->orderBy('n.nid');
+  // No entry in {disqus} table means status == 1.
+  $query->addExpression('IF(d.status IS NULL, 1, d.status)', 'status');
+  $disqus_status = $query->execute()->fetchField();
+
+  $row->setSourceProperty('disqus_status', $disqus_status);
+  $row->setSourceProperty('disqus_identifier', 'node/' . $row->getSourceProperty('tnid'));
+
+}

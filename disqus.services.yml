@@ -1,0 +1,12 @@
+services:
+  disqus.manager:
+    class: Drupal\disqus\DisqusCommentManager
+    arguments: ['@entity_type.manager', '@entity_field.manager', '@current_user', '@module_handler', '@config.factory', '@file_url_generator']
+  logger.channel.disqus:
+    parent: logger.channel_base
+    arguments: ['disqus']
+  disqus.new_comment_subscriber:
+    class: Drupal\disqus\EventSubscriber\NewCommentSubscriber
+    arguments: [ '@plugin.manager.mail', '@entity_type.manager', '@logger.factory', '@language_manager', '@router.no_access_checks' ]
+    tags:
+    - { name: 'event_subscriber' }
